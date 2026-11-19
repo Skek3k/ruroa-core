@@ -1,0 +1,13 @@
+{
+  "latest_version": "1.0.0",
+  "channel_name": "Ruroa",
+  "channel_tg": "ruroa",
+  "banner": {
+    "enabled": true,
+    "title": "Подписывайся на Ruroa",
+    "subtitle": "Свежие обновления приложения и полезные посты",
+    "button_text": "Перейти",
+    "link": "t.me/ruroa"
+  }
+}
+
