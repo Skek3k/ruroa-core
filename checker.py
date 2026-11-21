@@ -200,7 +200,7 @@ def main():
             if res is not None:
                 working.append(res)
 
-    working.sort(key=itemgetter(0))
+    working.sort(key=lambda x: (0 if "[REALITY]" in x[2] else 1, x[0]))
     best_keys = list(map(itemgetter(2), working[:70]))
     if best_keys:
         encoded_sub = base64.b64encode("\n".join(best_keys).encode("utf-8")).decode("utf-8")
