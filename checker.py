@@ -57,8 +57,11 @@ TG_CHANNELS = [
 
 BAD_KEYWORDS = [
     "russia", "🇷🇺", "belarus", "🇧🇾", "china", "🇨🇳",
-    "iran", "🇮🇷", "ru-", "ir-", "cn-", "127.0.0.", "0.0.0.0", "192.168.", "10.0."
+    "iran", "🇮🇷", "ru-", "ir-", "cn-", "127.0.0.", "0.0.0.0",
+    "192.168.", "10.0.", "timeweb", "selectel", "reg.ru", "moscow", "spb"
 ]
+
+BAD_SNI_TLDS = (".ru", ".su", ".by", ".ir", ".cn", ".rkn", ".local", ".test")
 
 CF_TLS_PORTS = {443, 8443, 2053, 2083, 2087, 2096}
 
@@ -107,8 +110,21 @@ def fetch_all_sources():
 def extract_host_port(key):
     match = re.search(r'@([^:/?#]+):(\d+)', key)
     if match:
-        return match.group(1), int(match.group(2))
+        return match.group(1).lower(), int(match.group(2))
     return None, None
+
+def is_valid_sni(key):
+    match = re.search(r'[?&]sni=([^&#]+)', key, re.IGNORECASE)
+    if not match:
+        return False
+    sni = urllib.parse.unquote(match.group(1)).strip().lower()
+    if "." not in sni or len(sni) < 4:
+        return False
+    if re.match(r'^\d+\.\d+\.\d+\.\d+$', sni):
+        return False
+    if sni.endswith(BAD_SNI_TLDS) or "fuck" in sni:
+        return False
+    return True
 
 def is_good_for_ru(key):
     key_lower = key.lower()
@@ -122,9 +138,7 @@ def is_good_for_ru(key):
     if not port:
         return False
 
-    # Вариант 1: VLESS + Reality (лучший обход ТСПУ)
-    is_reality = ("security=reality" in key_lower and "pbk=" in key_lower and "sni=" in key_lower)
-    # Вариант 2: VLESS + WebSocket + TLS на стандартных HTTPS-портах Cloudflare
+    is_reality = ("security=reality" in key_lower and "pbk=" in key_lower and is_valid_sni(key))
     is_ws_tls = ("security=tls" in key_lower and "type=ws" in key_lower and port in CF_TLS_PORTS)
 
     return is_reality or is_ws_tls
@@ -162,20 +176,32 @@ def check_server(key):
             base_key, *_ = key.split("#")
             tag = detect_tag(key)
             new_name = urllib.parse.quote(f"{tag} #{ping}ms")
-            return (ping, f"{base_key}#{new_name}")
+            return (ping, f"{host}:{port}", f"{base_key}#{new_name}")
     except Exception:
         return None
 
 def main():
     all_keys = fetch_all_sources()
-    filtered_keys = [k for k in all_keys if is_good_for_ru(k)]
+    # Предварительная дедупликация по host:port до проверки сокетом
+    unique_candidates = []
+    seen_endpoints = set()
+    for k in all_keys:
+        if not is_good_for_ru(k):
+            continue
+        host, port = extract_host_port(k)
+        endpoint = f"{host}:{port}"
+        if endpoint not in seen_endpoints:
+            seen_endpoints.add(endpoint)
+            unique_candidates.append(k)
+
     working = []
     with ThreadPoolExecutor(max_workers=100) as executor:
-        for res in executor.map(check_server, filtered_keys[:1500]):
+        for res in executor.map(check_server, unique_candidates[:1500]):
             if res is not None:
                 working.append(res)
+
     working.sort(key=itemgetter(0))
-    best_keys = list(map(itemgetter(1), working[:70]))
+    best_keys = list(map(itemgetter(2), working[:70]))
     if best_keys:
         encoded_sub = base64.b64encode("\n".join(best_keys).encode("utf-8")).decode("utf-8")
         with open("sub.txt", "w", encoding="utf-8") as f:
