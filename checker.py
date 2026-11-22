@@ -1,6 +1,8 @@
 import urllib.request
 import urllib.parse
 import socket
+import ssl
+import json
 import base64
 import time
 import re
@@ -61,10 +63,17 @@ BAD_KEYWORDS = [
     "192.168.", "10.0.", "timeweb", "selectel", "reg.ru", "moscow", "spb"
 ]
 
+BAD_COUNTRIES = {"RU", "BY", "CN", "IR", "KP", "SY"}
+PRIORITY_COUNTRIES = {"FI": 0, "EE": 1, "LV": 1, "LT": 1, "SE": 2, "DE": 3, "NL": 4, "PL": 5, "FR": 6, "GB": 7}
+COUNTRY_FLAGS = {
+    "FI": "🇫🇮 FI", "DE": "🇩🇪 DE", "NL": "🇳🇱 NL", "SE": "🇸🇪 SE",
+    "EE": "🇪🇪 EE", "LV": "🇱🇻 LV", "LT": "🇱🇹 LT", "PL": "🇵🇱 PL",
+    "FR": "🇫🇷 FR", "GB": "🇬🇧 UK", "US": "🇺🇸 US", "TR": "🇹🇷 TR",
+    "JP": "🇯🇵 JP", "CA": "🇨🇦 CA", "CH": "🇨🇭 CH", "AT": "🇦🇹 AT"
+}
+
 BAD_SNI_TLDS = (".ru", ".su", ".by", ".ir", ".cn", ".rkn", ".local", ".test")
-
 CF_TLS_PORTS = {443, 8443, 2053, 2083, 2087, 2096}
-
 def decode_if_base64(text):
     clean = text.strip()
     if "vless://" in clean:
@@ -89,123 +98,135 @@ def fetch_url_text(url):
 def fetch_all_sources():
     keys = set()
     with ThreadPoolExecutor(max_workers=20) as pool:
-        gh_texts = pool.map(fetch_url_text, GITHUB_SOURCES)
-        for raw in gh_texts:
+        for raw in pool.map(fetch_url_text, GITHUB_SOURCES):
             if not raw:
                 continue
-            content = decode_if_base64(raw)
-            for line in content.splitlines():
+            for line in decode_if_base64(raw).splitlines():
                 line = line.strip()
                 if line.startswith("vless://"):
                     keys.add(line)
-
-        tg_texts = pool.map(fetch_url_text, TG_CHANNELS)
-        for html in tg_texts:
+        for html in pool.map(fetch_url_text, TG_CHANNELS):
             if not html:
                 continue
-            found = re.findall(r'vless://[^\s"<>\']+', html)
-            for key in found:
+            for key in re.findall(r'vless://[^\s"<>\']+', html):
                 keys.add(key.replace("&amp;", "&").strip())
     return keys
-def extract_host_port(key):
-    match = re.search(r'@([^:/?#]+):(\d+)', key)
-    if match:
-        return match.group(1).lower(), int(match.group(2))
-    return None, None
 
-def is_valid_sni(key):
-    match = re.search(r'[?&]sni=([^&#]+)', key, re.IGNORECASE)
+def parse_vless_params(key):
+    base, *_ = key.split("#")
+    match = re.match(r'^vless://([^@]+)@([^:/?#]+):(\d+)\??(.*)$', base, re.IGNORECASE)
     if not match:
+        return None
+    uuid, host, port_str, query = match.groups()
+    if len(uuid) < 32:
+        return None
+    params = dict(urllib.parse.parse_qsl(query, keep_blank_values=True))
+    return {"host": host.lower(), "port": int(port_str), "params": params}
+
+def is_valid_sni(sni):
+    sni = sni.strip().lower()
+    if "." not in sni or len(sni) < 4 or re.match(r'^\d+\.\d+\.\d+\.\d+$', sni):
         return False
-    sni = urllib.parse.unquote(match.group(1)).strip().lower()
-    if "." not in sni or len(sni) < 4:
-        return False
-    if re.match(r'^\d+\.\d+\.\d+\.\d+$', sni):
-        return False
-    if sni.endswith(BAD_SNI_TLDS) or "fuck" in sni:
-        return False
-    return True
+    return not (sni.endswith(BAD_SNI_TLDS) or "fuck" in sni)
 
 def is_good_for_ru(key):
     key_lower = key.lower()
     if "allowinsecure=1" in key_lower or "allowinsecure=true" in key_lower:
         return False
-    for bad in BAD_KEYWORDS:
-        if bad in key_lower:
-            return False
-
-    _, port = extract_host_port(key)
-    if not port:
+    if any(bad in key_lower for bad in BAD_KEYWORDS):
         return False
 
-    is_reality = ("security=reality" in key_lower and "pbk=" in key_lower and is_valid_sni(key))
-    is_ws_tls = ("security=tls" in key_lower and "type=ws" in key_lower and port in CF_TLS_PORTS)
+    parsed = parse_vless_params(key)
+    if not parsed:
+        return False
+    p = {k.lower(): v for k, v in parsed["params"].items()}
+    sec = p.get("security", "").lower()
+    sni = p.get("sni", "")
 
-    return is_reality or is_ws_tls
-
-def detect_tag(key):
-    lower = key.lower()
-    proto = "REALITY" if "security=reality" in lower else "TLS-WS"
-    flags = {
-        "🇩🇪 DE": ["germany", "🇩🇪", "frankfurt", "de-", "hetzner"],
-        "🇳🇱 NL": ["netherlands", "🇳🇱", "amsterdam", "nl-"],
-        "🇫🇮 FI": ["finland", "🇫🇮", "helsinki", "fi-"],
-        "🇺🇸 US": ["united states", "🇺🇸", "usa", "us-", "ashburn", "dallas"],
-        "🇬🇧 UK": ["united kingdom", "🇬🇧", "london", "uk-"],
-        "🇫🇷 FR": ["france", "🇫🇷", "paris", "fr-"],
-        "🇸🇪 SE": ["sweden", "🇸🇪", "stockholm", "se-"],
-        "🇵🇱 PL": ["poland", "🇵🇱", "warsaw", "pl-"],
-        "🇹🇷 TR": ["turkey", "🇹🇷", "istanbul", "tr-"],
-        "🇯🇵 JP": ["japan", "🇯🇵", "tokyo", "jp-"]
-    }
-    for label, hints in flags.items():
-        if any(h in lower for h in hints):
-            return f"{label} [{proto}]"
-    return f"🌐 EU/US [{proto}]"
+    if sec == "reality":
+        pbk = p.get("pbk", "")
+        sid = p.get("sid", "")
+        return len(pbk) >= 42 and is_valid_sni(sni) and len(sid) <= 16
+    if sec == "tls" and p.get("type", "").lower() == "ws":
+        return parsed["port"] in CF_TLS_PORTS and (not sni or is_valid_sni(sni))
+    return False
 
 def check_server(key):
-    host, port = extract_host_port(key)
-    if not host or not port:
+    parsed = parse_vless_params(key)
+    if not parsed:
         return None
+    host, port, p = parsed["host"], parsed["port"], {k.lower(): v for k, v in parsed["params"].items()}
+    sni = p.get("sni") or host
+    is_reality = p.get("security", "").lower() == "reality"
+
     try:
         start = time.time()
-        with socket.create_connection((host, port), timeout=1.6):
-            ping = int((time.time() - start) * 1000)
-            if ping > 1500:
-                return None
-            base_key, *_ = key.split("#")
-            tag = detect_tag(key)
-            new_name = urllib.parse.quote(f"{tag} #{ping}ms")
-            return (ping, f"{host}:{port}", f"{base_key}#{new_name}")
+        with socket.create_connection((host, port), timeout=1.8) as raw_sock:
+            ctx = ssl.create_default_context()
+            if is_reality:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            with ctx.wrap_socket(raw_sock, server_hostname=sni):
+                ping = int((time.time() - start) * 1000)
+                if ping > 1600:
+                    return None
+                return {"key": key, "host": host, "port": port, "ping": ping, "is_reality": is_reality}
     except Exception:
         return None
 
+def resolve_countries(hosts):
+    geo_map = {}
+    unique_hosts = list(set(hosts))
+    url = "".join(["http://", "ip-api.", "com/batch?fields=query,countryCode"])
+    for i in range(0, len(unique_hosts), 100):
+        batch = unique_hosts[i:i+100]
+        try:
+            req = urllib.request.Request(url, data=json.dumps(batch).encode("utf-8"), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                for item in json.loads(resp.read().decode("utf-8")):
+                    if "query" in item and "countryCode" in item:
+                        geo_map[item["query"]] = item["countryCode"]
+        except Exception:
+            pass
+    return geo_map
+
 def main():
     all_keys = fetch_all_sources()
-    # Предварительная дедупликация по host:port до проверки сокетом
-    unique_candidates = []
-    seen_endpoints = set()
+    candidates, seen = [], set()
     for k in all_keys:
         if not is_good_for_ru(k):
             continue
-        host, port = extract_host_port(k)
-        endpoint = f"{host}:{port}"
-        if endpoint not in seen_endpoints:
-            seen_endpoints.add(endpoint)
-            unique_candidates.append(k)
+        parsed = parse_vless_params(k)
+        ep = f"{parsed['host']}:{parsed['port']}"
+        if ep not in seen:
+            seen.add(ep)
+            candidates.append(k)
 
     working = []
-    with ThreadPoolExecutor(max_workers=100) as executor:
-        for res in executor.map(check_server, unique_candidates[:1500]):
-            if res is not None:
+    with ThreadPoolExecutor(max_workers=100) as pool:
+        for res in pool.map(check_server, candidates[:1800]):
+            if res:
                 working.append(res)
 
-    working.sort(key=lambda x: (0 if "[REALITY]" in x[2] else 1, x[0]))
-    best_keys = list(map(itemgetter(2), working[:70]))
+    geo_map = resolve_countries([w["host"] for w in working])
+    filtered = []
+    for w in working:
+        cc = geo_map.get(w["host"], "")
+        if cc in BAD_COUNTRIES:
+            continue
+        proto = "REALITY" if w["is_reality"] else "TLS-WS"
+        flag = COUNTRY_FLAGS.get(cc, f"🌐 {cc}" if cc else "🌐 EU/US")
+        base_key, *_ = w["key"].split("#")
+        new_name = urllib.parse.quote(f"{flag} [{proto}] #{w['ping']}ms")
+        prio = PRIORITY_COUNTRIES.get(cc, 20)
+        filtered.append((0 if w["is_reality"] else 1, prio, w["ping"], f"{base_key}#{new_name}"))
+
+    filtered.sort(key=lambda x: (x[0], x[1], x[2]))
+    best_keys = list(map(itemgetter(3), filtered[:70]))
     if best_keys:
-        encoded_sub = base64.b64encode("\n".join(best_keys).encode("utf-8")).decode("utf-8")
+        encoded = base64.b64encode("\n".join(best_keys).encode("utf-8")).decode("utf-8")
         with open("sub.txt", "w", encoding="utf-8") as f:
-            f.write(encoded_sub)
+            f.write(encoded)
 
 if __name__ == "__main__":
     main()
