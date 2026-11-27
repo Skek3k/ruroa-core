@@ -13,6 +13,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Install Xray-core
+        run: |
+          curl -L -sS https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/xray.zip
+          unzip -q -o /tmp/xray.zip xray -d /usr/local/bin
+          chmod +x /usr/local/bin/xray
+          rm -f /tmp/xray.zip
       - run: python checker.py
       - run: |
           git config --local user.email "bot@github.com"
